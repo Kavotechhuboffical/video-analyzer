@@ -33,40 +33,47 @@ jobs:
           CONTEXT: ${{ inputs.context }}
         run: |
           python - <<'PY'
-          import os, math, time, base64, subprocess
+          import os, re, math, time, base64, subprocess
           import requests
           from scenedetect import detect, ContentDetector
           from faster_whisper import WhisperModel
 
           KEY = os.environ["GROQ_API_KEY"]
           CONTEXT = os.environ.get("CONTEXT", "").strip()
-          VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-          TEXT_MODEL = "llama-3.3-70b-versatile"
+          VISION_MODELS = ["qwen/qwen3.6-27b", "meta-llama/llama-4-scout-17b-16e-instruct"]
+          TEXT_MODELS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]
           API = "https://api.groq.com/openai/v1/chat/completions"
 
           def fmt(s):
               s = int(s)
               return f"{s//60:02d}:{s%60:02d}"
 
-          def groq(model, messages, max_tokens=700):
-              for attempt in range(5):
-                  r = requests.post(
-                      API,
-                      headers={"Authorization": "Bearer " + KEY},
-                      json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.5},
-                      timeout=120,
-                  )
-                  if r.status_code == 200:
-                      return r.json()["choices"][0]["message"]["content"].strip()
-                  print("Groq said", r.status_code, r.text[:300])
-                  if r.status_code == 429:
-                      try:
-                          wait = float(r.headers.get("retry-after", 10))
-                      except Exception:
-                          wait = 10
-                      time.sleep(min(wait, 60) + 1)
-                  else:
-                      break
+          def groq(models, messages, max_tokens=2000):
+              for model in models:
+                  for attempt in range(4):
+                      r = requests.post(
+                          API,
+                          headers={"Authorization": "Bearer " + KEY},
+                          json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.5},
+                          timeout=180,
+                      )
+                      if r.status_code == 200:
+                          text = r.json()["choices"][0]["message"].get("content") or ""
+                          text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+                          if text:
+                              print("Worked with model:", model)
+                              return text
+                          print("Empty answer from", model)
+                          break
+                      print("Groq said", r.status_code, "for", model, r.text[:300])
+                      if r.status_code == 429:
+                          try:
+                              wait = float(r.headers.get("retry-after", 10))
+                          except Exception:
+                              wait = 10
+                          time.sleep(min(wait, 60) + 1)
+                      else:
+                          break
               return None
 
           dur = float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", "video.mp4"]).decode().strip())
@@ -127,7 +134,7 @@ jobs:
                   prompt += " Extra facts from the video owner: " + CONTEXT
               desc = None
               if images:
-                  desc = groq(VISION_MODEL, [{"role": "user", "content": [{"type": "text", "text": prompt}] + images}], 500)
+                  desc = groq(VISION_MODELS, [{"role": "user", "content": [{"type": "text", "text": prompt}] + images}], 2000)
               notes.append(desc or "Could not describe this part.")
               time.sleep(2)
 
@@ -150,7 +157,7 @@ jobs:
           if CONTEXT:
               cprompt += "Facts from the video owner: " + CONTEXT + "\n\n"
           cprompt += joined
-          commentary = groq(TEXT_MODEL, [{"role": "user", "content": cprompt}], 1500)
+          commentary = groq(TEXT_MODELS, [{"role": "user", "content": cprompt}], 4000)
 
           # 6. Save the report
           lines = ["# Video report", "", f"Length: {fmt(dur)}", f"Parts found: {len(parts)}", ""]
