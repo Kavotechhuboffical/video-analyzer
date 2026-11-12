@@ -1,1 +1,64 @@
-.github/workflows/analyze.yml.
+name: Analyze Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: Direct link to the video file
+        required: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: pip install faster-whisper "scenedetect[opencv-headless]"
+
+      - name: Download video
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: curl -L -o video.mp4 "$VIDEO_URL"
+
+      - name: Analyze video
+        run: |
+          python - <<'PY'
+          import subprocess
+          from scenedetect import detect, ContentDetector
+          from faster_whisper import WhisperModel
+
+          def fmt(s):
+              s = int(s)
+              return f"{s//60:02d}:{s%60:02d}"
+
+          dur = float(subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration","-of","default=nw=1:nk=1","video.mp4"]).decode().strip())
+
+          scenes = detect("video.mp4", ContentDetector())
+          parts = [(a.get_seconds(), b.get_seconds()) for a, b in scenes]
+          if not parts:
+              parts = [(0.0, dur)]
+
+          segs = []
+          try:
+              model = WhisperModel("tiny", device="cpu", compute_type="int8")
+              out, info = model.transcribe("video.mp4")
+              segs = [(x.start, x.end, x.text.strip()) for x in out]
+          except Exception as e:
+              print("Speech step failed:", e)
+
+          lines = ["# Video report", "", f"Length: {fmt(dur)}", f"Parts found: {len(parts)}", ""]
+          for i, (a, b) in enumerate(parts, 1):
+              lines.append(f"## Part {i}: {fmt(a)} to {fmt(b)}")
+              said = [t for s, e, t in segs if s < b and e > a]
+              lines.append(" ".join(said) if said else "No speech in this part.")
+              lines.append("")
+
+          open("report.md", "w").write("\n".join(lines))
+          print("\n".join(lines))
+          PY
+
+      - name: Save report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: report.md
