@@ -6,6 +6,10 @@ on:
       video_url:
         description: Direct link to the video file
         required: true
+      context:
+        description: "Optional: teams, shirt colors, player names. Example: Portugal in red, Denmark in white"
+        required: false
+        default: ""
 
 jobs:
   analyze:
@@ -16,7 +20,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install tools
-        run: pip install faster-whisper "scenedetect[opencv-headless]"
+        run: pip install requests faster-whisper "scenedetect[opencv-headless]"
 
       - name: Download video
         env:
@@ -24,23 +28,72 @@ jobs:
         run: curl -L -o video.mp4 "$VIDEO_URL"
 
       - name: Analyze video
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          CONTEXT: ${{ inputs.context }}
         run: |
           python - <<'PY'
-          import subprocess
+          import os, math, time, base64, subprocess
+          import requests
           from scenedetect import detect, ContentDetector
           from faster_whisper import WhisperModel
+
+          KEY = os.environ["GROQ_API_KEY"]
+          CONTEXT = os.environ.get("CONTEXT", "").strip()
+          VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+          TEXT_MODEL = "llama-3.3-70b-versatile"
+          API = "https://api.groq.com/openai/v1/chat/completions"
 
           def fmt(s):
               s = int(s)
               return f"{s//60:02d}:{s%60:02d}"
 
-          dur = float(subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration","-of","default=nw=1:nk=1","video.mp4"]).decode().strip())
+          def groq(model, messages, max_tokens=700):
+              for attempt in range(5):
+                  r = requests.post(
+                      API,
+                      headers={"Authorization": "Bearer " + KEY},
+                      json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.5},
+                      timeout=120,
+                  )
+                  if r.status_code == 200:
+                      return r.json()["choices"][0]["message"]["content"].strip()
+                  print("Groq said", r.status_code, r.text[:300])
+                  if r.status_code == 429:
+                      try:
+                          wait = float(r.headers.get("retry-after", 10))
+                      except Exception:
+                          wait = 10
+                      time.sleep(min(wait, 60) + 1)
+                  else:
+                      break
+              return None
 
+          dur = float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", "video.mp4"]).decode().strip())
+
+          # 1. Find the parts of the video
           scenes = detect("video.mp4", ContentDetector())
-          parts = [(a.get_seconds(), b.get_seconds()) for a, b in scenes]
-          if not parts:
-              parts = [(0.0, dur)]
+          raw = [(a.get_seconds(), b.get_seconds()) for a, b in scenes] or [(0.0, dur)]
+          min_len = max(3.0, dur / 15)
+          max_len = max(6.0, dur / 10)
+          merged = []
+          cs, ce = raw[0]
+          for a, b in raw[1:]:
+              if ce - cs < min_len:
+                  ce = b
+              else:
+                  merged.append((cs, ce))
+                  cs, ce = a, b
+          merged.append((cs, ce))
+          parts = []
+          for a, b in merged:
+              n = max(1, math.ceil((b - a) / max_len))
+              step = (b - a) / n
+              for i in range(n):
+                  parts.append((a + i * step, a + (i + 1) * step))
+          print("Parts:", len(parts))
 
+          # 2. Write down the speech
           segs = []
           try:
               model = WhisperModel("tiny", device="cpu", compute_type="int8")
@@ -49,19 +102,76 @@ jobs:
           except Exception as e:
               print("Speech step failed:", e)
 
-          lines = ["# Video report", "", f"Length: {fmt(dur)}", f"Parts found: {len(parts)}", ""]
-          for i, (a, b) in enumerate(parts, 1):
-              lines.append(f"## Part {i}: {fmt(a)} to {fmt(b)}")
-              said = [t for s, e, t in segs if s < b and e > a]
-              lines.append(" ".join(said) if said else "No speech in this part.")
-              lines.append("")
+          # 3. Look at pictures from each part
+          def take_frame(t, name):
+              subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", "video.mp4", "-frames:v", "1", "-vf", "scale=512:-2", "-q:v", "6", name])
+              return name if os.path.exists(name) else None
 
-          open("report.md", "w").write("\n".join(lines))
-          print("\n".join(lines))
+          notes = []
+          for i, (a, b) in enumerate(parts, 1):
+              images = []
+              for k in range(4):
+                  t = a + (b - a) * (k + 0.5) / 4
+                  f = take_frame(t, f"f_{i}_{k}.jpg")
+                  if f:
+                      with open(f, "rb") as fh:
+                          data = base64.b64encode(fh.read()).decode()
+                      images.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + data}})
+              prompt = (
+                  f"These {len(images)} pictures are in time order from one part of a video, from {fmt(a)} to {fmt(b)}. "
+                  "Describe what is happening in plain, factual sentences: who is where, shirt colors, the ball, "
+                  "the movement and the action from the first picture to the last. "
+                  "Say only what you can see. Do not guess names. Do not say who a person is from their face."
+              )
+              if CONTEXT:
+                  prompt += " Extra facts from the video owner: " + CONTEXT
+              desc = None
+              if images:
+                  desc = groq(VISION_MODEL, [{"role": "user", "content": [{"type": "text", "text": prompt}] + images}], 500)
+              notes.append(desc or "Could not describe this part.")
+              time.sleep(2)
+
+          # 4. Join speech and notes
+          blocks = []
+          for i, ((a, b), desc) in enumerate(zip(parts, notes), 1):
+              said = " ".join(t for s, e, t in segs if s < b and e > a)
+              blocks.append(f"Part {i} [{fmt(a)} to {fmt(b)}]\nWhat is seen: {desc}\nSpeech: {said or 'none'}")
+          joined = "\n\n".join(blocks)
+
+          # 5. Write the commentary
+          cprompt = (
+              "You are an excited football commentator. Below are notes about a video, part by part, with times. "
+              "Write a commentary script that follows the video in order. Use lively, simple English. "
+              "Start each part with its time like [00:00 to 00:05]. "
+              "Use only facts from the notes and the speech. Do not invent names, scores, teams or events. "
+              "If the notes do not say who a player is, call them by shirt color or number. "
+              "Sound natural and exciting, like a real commentator.\n\n"
+          )
+          if CONTEXT:
+              cprompt += "Facts from the video owner: " + CONTEXT + "\n\n"
+          cprompt += joined
+          commentary = groq(TEXT_MODEL, [{"role": "user", "content": cprompt}], 1500)
+
+          # 6. Save the report
+          lines = ["# Video report", "", f"Length: {fmt(dur)}", f"Parts found: {len(parts)}", ""]
+          lines.append("## Commentary")
+          lines.append(commentary or "The commentary step failed. See the notes below.")
+          lines.append("")
+          lines.append("## Part by part notes")
+          lines.append("")
+          lines.append(joined)
+          text = "\n".join(lines)
+          open("report.md", "w").write(text)
+          print(text)
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as sf:
+                  sf.write(text)
           PY
 
       - name: Save report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: report
           path: report.md
